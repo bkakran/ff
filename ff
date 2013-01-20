@@ -1,0 +1,543 @@
+#!/usr/bin/perl -w
+#
+#use Fcntl;
+$0 =~ m/(.+)?\/([\w|.]+)$/i or die "path & name wrong!";
+$path = $1 if defined($1);
+$action = $bname = $2 if defined($2);
+$action = $action . " " . shift @ARGV if ($#ARGV >= 0 && $ARGV[0] =~ m/^[a-z]+$/i);
+if ($0 =~ m/\b--help\b/i)
+{
+	print $help_string;
+	exit;
+}
+
+while(@ARGV)
+{
+	$i = shift @ARGV; 
+	if ( $i =~ /^-f$/i && ($#ARGV >= 0)) { $file = shift @ARGV; }
+	elsif ( $i =~ /^[-|+]?\d+$/ && (! defined($from))) { $from = $i; $sleeptime = $i; }
+	elsif ( $i =~ /^[-|+]?\d+$/ && (! defined($to))) { $to = $i; $sleeptime = 10;}
+}
+
+$sleeptime = 10 if (! defined($sleeptime));  # default 10s
+$from      = -1 if (! defined($from));       # default first time
+$to        = 0  if (! defined($to));         # default last time
+$file = $path . "/stats" if (! defined($file));         # default last time
+
+#print "action=[$action]  from=[$from]  to=[$to]  sleeptime=[$sleeptime]   file=[$file]\n";
+
+$ifnum = get_net_stats();
+$rec_fmt = sprintf("A11A18A65A%d", 69 *  $ifnum);
+$uptime = 0;
+@mem = (0) x 2;
+@cpu = (0) x 6;
+@net = (0) x (9 * $ifnum);
+@overflow = (0) x scalar (@net);
+
+$help_string = 
+"$bname -- A perl script to stat Linux system counters of net/dev, memory and CPU.
+Usage: 
+      $bname [ action [options] ] [-f file]
+
+Actions and options:
+startd [num][-f file] -- Start this script as daemon progress which saves stats
+                         data per num seconds. The data file will be created or
+                         reset and firstly has a line like 'Daemon pid num ...'
+stopd [-f file]       -- Kill daemon progress accrording first line of 'file'
+                         and then append current stats data to the data file 
+                         which will be kept for you.
+reset [-f file]       -- Rebuild empty data file which only inlcudes head line.
+                         The head line will be kept if it starts with 'Daemon',
+                         otherwise it will be rebuilt starting with 'Manual'.
+query [from][to][-f file]
+                      -- query statictis of time zone by given 'from' and 'to'.
+                         from(s): The beginning time of statictis zone
+                                  -1 first time in data file (default)
+                                   0 last time in data file
+                                  >0 last time in Manual file or the nearest
+                                     time to it in Daemon file. If to(s) == 0,
+                                     it should be relative time.
+                         to(s)  : The end time of statictis zone
+                                   0 current time, not from file (default)
+                                  >0 last time from Manual file, or the nearest
+                                     time to it in Daemon file if found.
+                         FOR EXAMPLE:
+                         $bname query 0 => from last file time to current time
+                         $bname query   => from first file time to current time
+                                           equal to \'$bname query -1 0\'
+                         $bname query 9 => from 9s ago to current time, equal
+                                           to \'$bname query now-9 now\'
+                         $bname query 3213.34 32450 => from file time 3213.34
+                                           to file time 32450.00. Date in file
+                                           must be added by Daemon progress.
+
+help|--help           -- Print this help.
+no action word        -- The same as 'query' action as well as its options
+[-f file]             -- './stats' if omitted. Subject using it.";
+
+$_ = $action;
+# $action is string of binary basename and the first cmdline word (if has)
+# binary basename may be 'bt', 'bt.startd', 'bt.stopd' ... etc
+# cmdline word must be one of 'startd', 'stopd', 'qurey' and 'q'
+SWITCH: {
+/startd$/i && do {
+	if ($pid = fork()) { exit 0; } elsif ($pid < 0) { exit 1; }
+	print "Daemon progress mode ... OK\n" if setpgrp (0, 0);
+	open(STDIN, "< /dev/null");
+	open(STDERR, ">> /dev/null");
+	open(STDOUT, ">> /dev/null");
+	if ($pid = fork()) { exit 0; } elsif ($pid < 0) { exit 1; }
+	chdir($path) if defined ($path);
+	$file = reset_stats_file("Daemon", $rec_fmt, $sleeptime, $file);
+	while(1) 
+	{ 
+		if ((stat($file))[7] > 640000000) {
+			$file = reset_stats_file("File", $rec_fmt, $sleeptime, $file);
+		}
+		wakeup(); sleep $sleeptime;
+	}
+	exit 0;
+	};
+/stopd$/i && do {
+	open(STAT, "<$file") or die "Can't open $file: $!";
+	if ( <STAT> =~ m/^Daemon\s(\d+)\s\d+/i ) { kill 9, $1; print "Pid $1 killed.\n"; }
+	close STAT;
+	# Get overflow array of last line
+	if ( read_stats($file, 0, \@mem, \@cpu, \@overflow) <= 0)
+	{	# time_of_last_line + $rec_sec < $to
+		print "read_stats($file, 0, ...) failed.\n";
+		return 0;
+	}
+	wakeup();
+	exit 0;
+	};
+/reset$/i && do {
+	$file = reset_stats_file("File", $rec_fmt, $sleeptime, $file);
+	print "Done.\n";
+	exit 0;
+	};
+/query$|\s?q$|^$bname$/i && do {
+	unless ( -e $file)
+	{
+		$file = reset_stats_file("Manual", $rec_fmt, $sleeptime, $file);
+		print "No file \'$file\' found. Create it with 'Manual' mode ... done.\n";	
+	}
+	# if $from == -1, $from takes first time, $to should be 0 or obsolute time.
+	# manual mode, $to (0 | >0) takes (current | last)
+	# daemon mode, $to (0 | >0) takes (current | midle)
+
+
+	# if $from == 0, $from takes last time, so $to must take current time
+	$to = 0 if ($from == 0);
+
+	# if $from > 0 && $to == 0, $to use current time, so $from is relative time
+	$from = get_uptime() - $from if ($from > 0 && $to == 0);
+
+	# if $from > 0 && $to > 0, they are all obsolute time, nothing to change
+
+	stats($file, $from, $to);
+	exit 0;
+	};
+	print "$help_string\n";
+	exit 0;
+}
+
+
+sub wakeup # $file
+{
+	$uptime  = get_uptime();
+	@mem = get_mem_stats();
+	@cpu = get_cpu_stats();
+	@net = get_net_stats();
+	for (my $i = 0; $i < $#net; $i += 9)
+	{
+		$net[$i+1] = ( ($net[$i+5] < $overflow[$i+5]) ? $overflow[$i+1] + 1 : $overflow[$i+1] );
+		$net[$i+2] = ( ($net[$i+6] < $overflow[$i+6]) ? $overflow[$i+2] + 1 : $overflow[$i+2] );
+		$net[$i+3] = ( ($net[$i+7] < $overflow[$i+7]) ? $overflow[$i+3] + 1 : $overflow[$i+3] );
+		$net[$i+4] = ( ($net[$i+8] < $overflow[$i+8]) ? $overflow[$i+4] + 1 : $overflow[$i+4] );
+	}
+	write_stats($file, $rec_fmt, $uptime, \@mem, \@cpu, \@net);
+	@overflow = @net;
+}
+
+# to be called when restart monitoring
+sub reset_stats_file # $mode, $rec_fmt, [$rec_sec,] [$filename]
+{
+	my ($mode, $rec_fmt, $rec_sec, $filename) = @_;
+	if (! defined ($filename)) { $filename = "stats"; }
+	if (! defined ($rec_sec)) { $rec_sec = 10; }
+	my $filetype = "Manual";
+	my $headline = "";
+	if( open (STAT, "<$filename"))
+	{
+		chomp ($headline = <STAT>);
+		if ( $headline =~ m/^Daemon\s(\d+)\s\d+/i ) 
+		{
+			my $pid = $1;
+			unless ($mode =~ m/File/i)
+			{
+				print "mode=$mode\n";
+				kill (9, $pid);
+			} 
+			$filetype = "Daemon";
+		}
+		close STAT;
+		unlink ($filename);
+	}
+
+	# calculting $rec_len	
+	$rec_len = 1; # for \n 
+	while($rec_fmt =~ m/[^\d]+(\d+)/g) { $rec_len += $1; }
+
+	if ($mode =~ m/File/i) # Obey mode from existed file, default 'Manual' if no file.
+	{	# we searched the file but no file or no 'Daemon' mode found
+		if ($headline !~ /^Daemon/)
+		{
+			$headline = "$filetype $$ $rec_sec $rec_len $rec_fmt";
+		}
+		# no modify $headline, meaning keep original pid & rec_fmt & rec_sec
+	}
+	else # Must obey $mode specified in parameters and take current pid
+	{
+		$headline = "$mode $$ $rec_sec $rec_len $rec_fmt";
+	}
+	open(STAT, ">$filename") or die "Can not create file $filename: $!";
+	flock(STAT, 2);
+	print STAT "$headline\n";
+	flock(STAT, 8);
+	close STAT;
+	return "$filename";
+}
+
+# return $total_time, $used_time, $irq_time, $softirq_time, $sys_time, $iowait_time
+sub get_cpu_stats
+{
+	open(STAT, "</proc/stat") or die "Can't open /proc/stat : $!\n";
+	while(<STAT>)
+	{
+		if (/^cpu\s+(.+)/) 
+		{
+			close STAT;
+			my $cputime = 0;
+			my @cpu = split(' ', $1);
+			foreach (@cpu) { $cputime += $_; }
+			# 0:user, 1:nice, 2:system, 3:idle, 4:iowait, 5:irq, 6:softirq
+			return ($cputime, $cputime - $cpu[3], @cpu[5,6,2,4]);
+		}
+	}
+	close STAT;
+	return undef;
+}
+
+# memtotal, memfree, buffers, cached
+sub get_mem_stats
+{
+	my $memtotal = 0;
+	my $memfree  = 0;
+	my $buffers  = 0;
+	my $cached   = 0;
+
+	open(STAT, "</proc/meminfo") or die "Can't open /proc/meminfo : $!\n";
+	while(<STAT>)
+	{
+        	if(/^MemTotal:\s+(\d+)/){ $memtotal = $1; }
+	        elsif(/^MemFree:\s+(\d+)/){ $memfree = $1; }
+        	elsif(/^Buffers:\s+(\d+)/){ $buffers = $1; }
+	        elsif(/^Cached:\s+(\d+)/){ $cached = $1; last; }
+	}
+	close STAT;
+        return $memtotal - $memfree, $cached + $buffers;
+}
+
+sub get_uptime
+{
+	open(STAT, "</proc/uptime") or die "Can't open /proc/uptime : $!\n";
+	return (split (' ',<STAT>))[0];
+}
+
+sub get_net_stats
+{
+	my @a;
+	my @ethx;
+	my $ifnum = 0;
+	open(STAT, "</proc/net/dev") or die "Can't open /proc/net/dev : $!\n";
+	while(<STAT>)
+	{
+		if(/^\s+(eth\d+):(.+)/)
+		{
+        		@ethx = split(' ', $2);
+			if ($ethx[0] eq '0') { next; }
+			push(@a,  ($1, 0, 0, 0, 0, @ethx[1, 9, 0, 8])); 
+			$ifnum++;
+		}
+	}
+	close STAT;
+	return wantarray ? @a : $ifnum;
+}
+
+sub write_stats # $statsfile, $rec_fmt, $uptime, \@mem, \@cpu, \@net
+{
+	my ($statsfile, $rec_fmt, $uptime, $mem, $cpu, $net) = @_;
+	my $to = pack ( $rec_fmt, $uptime,
+			join(':', @{$mem}),
+			join(':', @{$cpu}),
+			join(':', @{$net}));
+	open (STAT, ">>$statsfile") or die "Can not open $statsfile: $!";
+	flock (STAT, 2); # 2 ==> LOCK_EX
+	print STAT "$to\n";
+	flock (STAT, 8); # 8 ==> LOCK_IN
+	close STAT;
+	return length($to);
+}
+
+# Retrieve a line of data from $statsfile by given absolute time $uptime
+# Daemon yes: (-1)first line, (0)last line, (>0)nearest line less than $uptime
+# Daemon  no: (-0)first line, (0)last line, (>0)last line
+sub read_stats # $statsfile, $uptime, \@memory, \@cpu, \@netstats
+{
+	my ($line, $headsize, $pos0, $pos1);
+	my ($statsfile, $uptime, $mem, $cpu, $net) = @_;
+	my $fsize = (stat ($statsfile))[7];
+	if ($fsize < 200) { print "Too short filesize: $fsize\n"; return 0; }
+	open (STAT, "<$statsfile") or die "Can not open $statsfile: $!";
+	chomp ($line = <STAT>);
+	$headsize = length($line) + 1;
+	my ($mode, $pid, $rec_sec, $rec_len) = split(' ', $line);
+	if ($rec_len < 90 || $rec_sec < 2) { print "Wrong parameters: rec_sec=$rec_sec, rec_len=$rec_len\n"; return 0; }
+	my $rec_num = sprintf("%d", ($fsize - $headsize) / $rec_len);
+	if ($rec_num < 1) { print "No record in $statsfile.\n"; return 0; }
+
+	# If $uptime == -1, get the second line of $statsfile for return
+	# If $uptime > 0, need the second line to get start position
+	chomp ($line = <STAT>);
+	
+	# If $uptime == 0, get the lastest lines for return
+	# If $uptime > 0, need the lastest lines to get stop position
+	if ($uptime >= 0)
+	{
+		# keep time of first data line
+		$pos0 = (split(' ', $line, 2))[0];
+		# get last data from the lastest line of $statsfile
+		seek (STAT, -$rec_len, 2) or die "Seek($statsfile,-$rec_len, 2) failed: $!";
+		chomp ($line = <STAT>);
+	}
+
+	# Search for getting middle line, $statsfile must be created by Daemon process
+	if ($uptime > 0 && $mode =~ m/Daemon/i)
+	{
+		$pos1 = (split(' ', $line, 2))[0];
+
+		# Time goes away so much, is Daemon progress dead?
+		if ($uptime > $pos1 + $rec_sec || $uptime <= $pos0)
+		{
+			printf("Given obsolute time %.2f is not between Min(%.2f) and\nMax(%.2f) time from date file $statsfile\n",
+				 $uptime, $pos0, $pos1 + $rec_sec);
+			close STAT; return 0;
+		}
+
+		# If $uptime >= $pos1, no need to get midle line
+		if ($uptime < $pos1)
+		{
+			$pos0 = $rec_num - (($pos1 + $rec_sec - $uptime) / $rec_sec);
+			$pos0 = $pos0 < 0 ? 0 : int ($pos0);
+			seek(STAT, int($headsize + $pos0 * $rec_len), 0);
+			$uptime = $uptime - $rec_sec > 0 ? $uptime - $rec_sec : 0;
+			while(<STAT>){
+				if ((split(' ', $_, 2))[0] > $uptime){
+					chomp ($line = $_);
+					last;
+				}
+			}
+		}
+	}
+	close STAT;
+
+	# return data
+	my @data = split(" ", $line);
+	@{$mem}  = split(":", $data[1]);
+	@{$cpu}  = split(":", $data[2]);
+	@{$net}  = split(":", $data[3]);
+
+	return $data[0];
+}
+
+
+# Stats output for time zone between $from and $to
+# $from: -1 (first time in $statsfile), 0 (last time in $statsfile), >0 (midle line)
+# $to  : >0 (midle line if daemon mode, or last line if manual mode), 0 (current time)
+sub stats # $statsfile $from [$to]
+{
+	my ($statsfile, $from, $to) = @_;
+	my ($uptime, $uptime1, @mem, @mem1, @cpu, @cpu1, @net, @net1, $i, $j, $z);
+	
+	# get stats at $from time by searching in $statsfile
+	$uptime = read_stats($statsfile, $from, \@mem, \@cpu, \@net);
+	if($uptime <= 0)
+	{
+		open (STAT, "< $statsfile") or die "Can't read file $statsfile: $!";
+		my ($mode, undef, undef, undef, $rec_fmt) = split(' ', <STAT>);
+		close STAT;
+		if ($mode =~ m/^Manual/i)
+		{
+			$uptime1 = get_uptime();
+			@net1 = get_net_stats();
+			@mem1 = get_mem_stats();
+			@cpu1 = get_cpu_stats();
+			write_stats($statsfile, $rec_fmt, $uptime1, \@mem1, \@cpu1, \@net1);
+			print "Manual mode: No file/data found. First line data will be added.\n";
+		}
+		else
+		{
+			print "Daemon mode: No file/data found. Daemon progress dead?\n";
+		}
+		return 0;
+	}
+	if (! defined($to)) { $to = 0; }
+	if ($to < 0 || ($to>1 && $from>1 && $to<=$from))
+	{
+		print "to($to) must be large than 1 and from($from) !\n";
+		return 0;
+	}
+	if ($to > 0) # $to > 0, get stats of time $to by searching in $statsfile
+	{
+		if ($to == 1) { $to = 0; }
+		$uptime1 = read_stats($statsfile, $to, \@mem1, \@cpu1, \@net1);
+		# read_stats will return:
+		# time in last line in manual mode
+		# time in midle line indaemon mode (may be the last line)
+		# 0 if $to is too large in daemon mode
+		# 0 if reading file failed
+		if ($uptime1 <= 0)
+		{
+			print "read_stats($statsfile, $to, ...) failed.";
+			return 0;
+		}
+		if ($uptime1 - $uptime <= 2) 
+		{      # check if they are a same line or not
+			print ("time zone too small: %.2f", $uptime1-$uptime);
+			return 0;
+		}
+	}
+	else  # $to == 0, use current time and overflow counters of last line
+	{
+		$to = get_uptime();
+		# need the lastest line overflow counters
+		# if $statsfile is created by Daemon progress, $to must be near to the time
+		# of last line, otherwise read_stats() will return 0;
+		my @overflow;
+		if ( read_stats($statsfile, $to, \@mem1, \@cpu1, \@overflow) <= 0)
+		{	# time_of_last_line + $rec_sec < $to
+			print "read_stats($statsfile, now($to), ...) failed.\n";
+			return 0;
+		}
+		@net1 = get_net_stats();
+		@mem1 = get_mem_stats();
+		@cpu1 = get_cpu_stats();
+		$uptime1 = $to;
+		for ($i = 0; $i < $#net1; $i += 9){
+			for ($j = 1; $j < 5; $j++){
+				$net1[$i+$j] = ($net1[$i+$j+4] < $overflow[$i+$j+4] ? 
+                                                $overflow[$i+$j] + 1 : $overflow[$i+$j]);
+			}
+		}
+		open (STAT, "< $statsfile") or die "Can't read file $statsfile: $!";
+		my ($mode, undef, undef, undef, $rec_fmt) = split(' ', <STAT>);
+		close STAT;
+		if($mode =~ m/^Manual/)
+		{
+			write_stats($statsfile, $rec_fmt, $uptime1, \@mem1, \@cpu1, \@net1);
+		}
+	}
+
+	# calculting time interval
+	$uptime = $uptime1 - $uptime;
+	
+	# calculting statictis to output
+	foreach (@mem1) { $_ /= 1024; $_ = sprintf("%.1fMb", $_); } # change Kb to Mb
+
+	# calculting CPU percent
+	foreach $i (0 .. $#cpu) { $cpu[$i] = $cpu1[$i] - $cpu[$i]; }
+	foreach $i (1 .. $#cpu) { $cpu[$i] = $cpu[$i] * 100 / $cpu[0]; }
+
+	# put counters diff to $net
+	for ($i = 0; $i < $#net; $i += 9){
+		for ($j = 1; $j < 9; $j++){
+			$net[$i+$j] = $net1[$i+$j] - $net[$i+$j];
+		}
+	}
+	
+	# put average values (diff/sec) to $net1
+	$z = (1073741824 / $uptime) * 4;
+	for ($i = 0; $i  < $#net1; $i += 9) {
+    		for ($j = 1; $j < 5; $j++) {
+        		$net1[$i+$j+4] = $net[$i+$j] * $z  + $net[$i+$j+4] / $uptime; 
+                        # 5: rx_#/s, 6: tx_#/s, 7: rx_bytes/s, 8: tx_bytes, ...
+			#if ($j > 2) { $net1[$i+$j+4] /= 2**17; } # 1024*1024/8=2^17
+			# 7: rx_Mbps,  8: tx_Mbps
+			if($j > 2)
+			{
+				if($net1[$i+$j+4] > 127987) # 999.9kbps = 127987.2 * 8bit
+				{
+					$net1[$i+$j+4] = sprintf("%0.1fM", $net1[$i+$j+4] / (2**17));
+				}
+				elsif($net1[$i+$j+4] > 12800) # 100kbps = 12800 * 8bit
+				{
+					$net1[$i+$j+4] = sprintf("%0.1fK", $net1[$i+$j+4] / (2**7));
+				}
+				else
+				{
+					$net1[$i+$j+4] = sprintf("%ld", $net1[$i+$j+4] * 8);
+				}
+			}
+    		}
+	}
+	
+	# update display style for counters diff in @net
+	for ($i = 0; $i < $#net; $i += 9){
+		for ($j = 1; $j < 5; $j++){
+			if ($net[$i+$j] > 24998) # 99999.9G --> 24998*4G + 4G
+			{
+				$net[$i+$j+4] = $net[$i+$j] / (2**8) + $net[$i+$j+4] / (2**40);
+				$net[$i+$j+4] = sprintf("%.1fT", $net[$i+$j+4]);
+			}
+			if ($net[$i+$j] > 23) # 99999.9M --> 23*4096M + 4096M
+			{
+				$net[$i+$j+4] = $net[$i+$j] * 4 + $net[$i+$j+4] / (2**30);
+				$net[$i+$j+4] = sprintf("%.1fG", $net[$i+$j+4]);
+			}
+			elsif ($net[$i+$j] > 0 || $net[$i+$j+4] > 102399897) # 99999.9K --> 102399897
+			{
+				$net[$i+$j+4] = $net[$i+$j] * (2**12) + $net[$i+$j+4] / (2**20);
+				$net[$i+$j+4] = sprintf("%.1fM", $net[$i+$j+4]);
+			}
+			elsif ($net[$i+$j+4] > 99999999)
+			{
+				$net[$i+$j+4] = $net[$i+$j+4] / (2**10);
+				$net[$i+$j+4] = sprintf("%.1fK", $net[$i+$j+4]);
+
+			}
+		}
+	}
+
+#print "uptime=$uptime\navg.net1=\n@net1\ndiff.net=\n@net\n"; exit;
+
+# Preparing output
+format cpumem =
+interval(s)  cpu%  irq% sirq%  sys% iowt%  mem_used  buf&cached
+@#######.##@###.#@###.#@###.#@###.#@###.#@>>>>>>>>>@>>>>>>>>>>>
+$uptime, @cpu[1 .. 5], @mem1
+.
+format if_stat_top =
+---------------------------------------------------------------------
+if_n    rx_pkt   tx_pkt  rx_byte  tx_byte rx_pps tx_pps rx_bps tx_bps
+.
+format if_stat =
+@<<<<@>>>>>>>>@>>>>>>>>@>>>>>>>>@>>>>>>>>@######@######@>>>>>>@>>>>>>
+$net[$i], @net[$i+5 .. $i+8], @net1[$i+5 .. $i+8]
+.
+	# Output
+	$~ = 'cpumem'; write;
+	$~ = 'if_stat_top'; write;
+	$~ = 'if_stat'; for ($i = 0; $i < $#net; $i += 9) { write; }
+	return 1;
+}
